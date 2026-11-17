@@ -16,7 +16,7 @@ Használat Colabban: a notebookok betöltő cellája gondoskodik róla. Kézzel:
 """
 from __future__ import annotations
 
-__version__ = "1.3"
+__version__ = "1.8"
 
 import os
 import re
@@ -106,7 +106,8 @@ def ensure_packages(quiet: bool = True) -> None:
     for mod, pkg in [("soundfile", "soundfile"), ("sklearn", "scikit-learn"),
                      ("torch", "torch"), ("transformers", "transformers"),
                      ("opensmile", "opensmile"), ("pandas", "pandas"),
-                     ("matplotlib", "matplotlib")]:
+                     ("matplotlib", "matplotlib"), ("datasets", "datasets"),
+                     ("skimage", "scikit-image")]:
         try:
             __import__(mod)
         except ImportError:
@@ -346,6 +347,17 @@ def librosa_features(waves, sr: int = SR, n_mfcc: int = 20,
 # --------------------------------------------------------------------------
 # 4. Önfelügyelt beszédmodell-embedding
 # --------------------------------------------------------------------------
+def _is_oom(exc) -> bool:
+    """Memóriahiány-e? Régebbi torch sima RuntimeError-t dob, nem OutOfMemoryError-t."""
+    try:
+        import torch
+        if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+            return True
+    except Exception:
+        pass
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 _MODEL_CACHE: dict = {}
 
 
@@ -419,13 +431,15 @@ def wavlm_embeddings(waves, model_name: str = "microsoft/wavlm-base-plus",
                                   .cpu().numpy())
                 out_layers.append(np.stack(pooled))  # (L+1, B, D)
                 start += batch_size
-            except torch.cuda.OutOfMemoryError:
+            except Exception as exc:
+                if not _is_oom(exc):
+                    raise
                 # kevés VRAM (pl. 4 GB-os laptop GPU): felezzük a batch méretet
                 torch.cuda.empty_cache()
                 if batch_size == 1:
                     raise RuntimeError(
                         "Egyetlen felvétel sem fér a GPU memóriájába. Próbáld "
-                        "device='cpu'-val, vagy rövidítsd a felvételeket.")
+                        "device='cpu'-val, vagy rövidítsd a felvételeket.") from exc
                 batch_size = max(1, batch_size // 2)
                 print(f"\n  [kevés a VRAM — batch_size → {batch_size}]")
             if show_progress and start % (batch_size * 20) == 0:
@@ -763,6 +777,12 @@ def self_check(verbose: bool = True) -> bool:
     ok = not hianyzik and not hianyzo_fv
     if verbose:
         print(f"ser_utils v{__version__}")
+        for nev in ("torch", "transformers", "datasets", "sklearn"):
+            try:
+                m = importlib.import_module(nev)
+                print(f"  {nev:<13s} {getattr(m, '__version__', '?')}")
+            except ImportError:
+                pass
         print(f"  függvények: {len(kell) - len(hianyzo_fv)}/{len(kell)} megvan")
         if hianyzo_fv:
             print(f"  HIÁNYZÓ FÜGGVÉNY: {', '.join(hianyzo_fv)} — a fájl csonka, töltsd le újra")
@@ -929,3 +949,557 @@ def merge_labels(y, csoportok: dict, uj_nev: str | None = None):
         for r in regiek:
             y[y == r] = uj
     return y.astype(str)
+
+
+# --------------------------------------------------------------------------
+# 11. Ál-dimenziós regresszió (demó): kategóriák vetítése a valencia-arousal síkra
+# --------------------------------------------------------------------------
+# FIGYELEM: a RAVDESS-ben NINCS valencia-arousal annotáció — csak kategória és
+# kétfokozatú intenzitás. Az alábbi koordináták a körkörös (circumplex) modell
+# szerinti SZÁRMAZTATOTT értékek, nem mérés. A blokk célja kizárólag az, hogy
+# megmutassa, hogyan néz ki egy dimenziós regresszió; az itt kapott számok NEM
+# hasonlíthatók össze valódi dimenziós korpuszokon (MSP-Podcast, IEMOCAP)
+# mért eredményekkel.
+VA_MAP = {
+    "semleges":     (0.00,  0.00),
+    "nyugodt":      (0.50, -0.60),
+    "öröm":         (0.70,  0.45),
+    "szomorúság":  (-0.62, -0.48),
+    "harag":       (-0.58,  0.70),
+    "félelem":     (-0.70,  0.52),
+    "undor":       (-0.78,  0.18),
+    "meglepettség": (0.02,  0.93),
+}
+
+
+def category_to_va(labels, mapping: dict | None = None):
+    """Kategóriacímkékből (N, 2) alakú valencia-arousal céltömb.
+
+    A leképezés származtatott, nem annotáció — lásd a VA_MAP megjegyzését.
+    """
+    mapping = mapping or VA_MAP
+    labels = np.asarray(labels)
+    ismeretlen = sorted(set(labels) - set(mapping))
+    if ismeretlen:
+        raise ValueError(f"nincs koordináta ezekhez: {ismeretlen}")
+    return np.array([mapping[l] for l in labels], dtype=np.float32)
+
+
+def ccc(y_true, y_pred) -> float:
+    """Lin-féle konkordancia-korrelációs együttható (CCC).
+
+    A Pearson-korrelációval szemben a torzítást és a skálakülönbséget is
+    bünteti — ezért ez a dimenziós érzelembecslés standard metrikája.
+    """
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    mt, mp = y_true.mean(), y_pred.mean()
+    vt, vp = y_true.var(), y_pred.var()
+    cov = ((y_true - mt) * (y_pred - mp)).mean()
+    nevezo = vt + vp + (mt - mp) ** 2
+    return float(2 * cov / nevezo) if nevezo > 0 else 0.0
+
+
+def run_va_regression(X, labels, train_mask, test_mask, mapping: dict | None = None,
+                      C: float = 10.0, verbose: bool = True):
+    """Ál-dimenziós regresszió: valencia és arousal becslése külön modellel.
+
+    Visszaad egy szótárat a becslésekkel és a metrikákkal (CCC, Pearson, RMSE).
+    """
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVR
+    from scipy.stats import pearsonr
+
+    Y = category_to_va(labels, mapping)
+    res = {"nev": "ál-VA regresszió", "y_true": Y[test_mask],
+           "labels_test": np.asarray(labels)[test_mask], "modellek": {}}
+    becslesek = []
+    for j, dim in enumerate(["valencia", "arousal"]):
+        reg = make_pipeline(StandardScaler(), SVR(kernel="rbf", C=C, gamma="scale"))
+        reg.fit(X[train_mask], Y[train_mask, j])
+        pred = reg.predict(X[test_mask])
+        becslesek.append(pred)
+        igaz = Y[test_mask, j]
+        res["modellek"][dim] = reg
+        res[dim] = {
+            "ccc": ccc(igaz, pred),
+            "pearson": float(pearsonr(igaz, pred)[0]),
+            "rmse": float(np.sqrt(((igaz - pred) ** 2).mean())),
+        }
+        if verbose:
+            m = res[dim]
+            print(f"  {dim:<9s} CCC = {m['ccc']:.3f} · r = {m['pearson']:.3f} "
+                  f"· RMSE = {m['rmse']:.3f}")
+    res["y_pred"] = np.stack(becslesek, axis=1)
+    res["atlag_ccc"] = (res["valencia"]["ccc"] + res["arousal"]["ccc"]) / 2
+    if verbose:
+        print(f"  átlagos CCC = {res['atlag_ccc']:.3f}")
+    return res
+
+
+def va_to_category(pred_va, mapping: dict | None = None):
+    """A becsült (valencia, arousal) pontokat a legközelebbi kategóriához rendeli.
+
+    Ezzel mérhető, hogy a regresszió hordoz-e TÖBB információt, mint a közvetlen
+    osztályozás — vagy csak ugyanazt kerülő úton.
+    """
+    mapping = mapping or VA_MAP
+    nevek = list(mapping)
+    horgonyok = np.array([mapping[n] for n in nevek], dtype=np.float32)
+    d = ((np.asarray(pred_va)[:, None, :] - horgonyok[None, :, :]) ** 2).sum(-1)
+    return np.array(nevek, dtype=object)[d.argmin(1)].astype(str)
+
+
+def plot_va_regression(res, mapping: dict | None = None):
+    """Két panel: a VA-sík a horgonyokkal és a becslésekkel, plusz dimenziónkénti szórásdiagram."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    mapping = mapping or VA_MAP
+    P, T = res["y_pred"], res["y_true"]
+    cimkek = res["labels_test"]
+    nevek = list(mapping)
+    szinek = plt.cm.tab10(np.linspace(0, 1, 10))[:len(nevek)]
+    szin_map = {n: szinek[i] for i, n in enumerate(nevek)}
+
+    fig = plt.figure(figsize=(13, 5.2))
+    ax = fig.add_subplot(1, 2, 1)
+    ax.add_patch(Circle((0, 0), 1.0, fill=False, color="#6B7280", lw=1.1,
+                        ls=(0, (4, 4))))
+    ax.axhline(0, color="#6B7280", lw=.9)
+    ax.axvline(0, color="#6B7280", lw=.9)
+    for n in nevek:
+        m = cimkek == n
+        if m.sum():
+            ax.scatter(P[m, 0], P[m, 1], s=14, alpha=.45, color=szin_map[n],
+                       edgecolors="none")
+        vx, vy = mapping[n]
+        ax.scatter([vx], [vy], s=170, marker="X", color=szin_map[n],
+                   edgecolors="white", linewidths=1.6, zorder=5)
+        # a feliratot sugárirányban kifelé toljuk, hogy ne fedjék egymást
+        r = (vx ** 2 + vy ** 2) ** 0.5
+        if r < 1e-6:
+            dx, dy = 0.0, 16.0
+        else:
+            dx, dy = 20 * vx / r, 20 * vy / r
+        ax.annotate(n, (vx, vy), textcoords="offset points", xytext=(dx, dy),
+                    ha="center", va="center", fontsize=9, color="#1A1A1A",
+                    zorder=6)
+    ax.set_xlim(-1.35, 1.35)
+    ax.set_ylim(-1.35, 1.35)
+    ax.set_aspect("equal")
+    ax.set_xlabel("valencia")
+    ax.set_ylabel("arousal")
+    ax.set_title("X = a kategóriák származtatott helye · pont = a modell becslése",
+                 fontsize=10.5, loc="left", color="#6B7280")
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+
+    for k, dim in enumerate(["valencia", "arousal"]):
+        a = fig.add_subplot(2, 2, 2 * (k + 1))
+        for n in nevek:
+            m = cimkek == n
+            if m.sum():
+                a.scatter(T[m, k] + np.random.default_rng(k).normal(0, .012, m.sum()),
+                          P[m, k], s=12, alpha=.45, color=szin_map[n],
+                          edgecolors="none")
+        lim = [-1.05, 1.05]
+        a.plot(lim, lim, color="#A63A3A", lw=1.1, ls="--")
+        a.set_xlim(*lim)
+        a.set_ylim(*lim)
+        a.set_ylabel("becsült")
+        if k == 1:
+            a.set_xlabel("származtatott cél")
+        m = res[dim]
+        a.set_title(f"{dim}:  CCC = {m['ccc']:.3f} · r = {m['pearson']:.3f} "
+                    f"· RMSE = {m['rmse']:.3f}", fontsize=10, loc="left",
+                    color="#6B7280")
+        a.grid(alpha=.2)
+        a.set_axisbelow(True)
+        for sp in ("top", "right"):
+            a.spines[sp].set_visible(False)
+    fig.tight_layout()
+    return fig
+
+
+# ==========================================================================
+#  12. KÉPI MODALITÁS — arckifejezés-alapú felismerés
+# ==========================================================================
+# A FER2013-at a clip-benchmark webdataset-tükréből töltjük (nyilvános, nem
+# kér regisztrációt). FIGYELEM: ennek a tükörnek a címkesorrendje ÁBÉCÉS, nem
+# a Kaggle-féle eredeti sorrend — innen a lenti leképezés.
+FER_CLASSES_EN = ["angry", "disgusted", "fearful", "happy",
+                  "neutral", "sad", "surprised"]
+FER_CLASSES_HU = ["harag", "undor", "félelem", "öröm",
+                  "semleges", "szomorúság", "meglepettség"]
+FER_DATASET = "clip-benchmark/wds_fer2013"
+
+
+def load_fer2013(n_train: int = 4000, n_test: int = 1500, seed: int = 0,
+                 dataset_name: str = FER_DATASET, show_progress: bool = True):
+    """FER2013 betöltése és véletlen mintavétele (48x48 szürkeárnyalatos arcok).
+
+    A teljes korpusz 28,7 ezer tanító és 7,2 ezer teszt kép; órán ennek a
+    töredéke is bőven elég. Visszatér: (kepek_tr, y_tr, kepek_te, y_te),
+    ahol a képek PIL-objektumok, a címkék magyar nevek.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset_name)
+    if show_progress:
+        print("elérhető splitek:", {k: len(v) for k, v in ds.items()})
+
+    def kep_oszlop(d):
+        for k in ("jpg", "image", "png"):
+            if k in d.column_names:
+                return k
+        raise RuntimeError(f"nem találom a képoszlopot: {d.column_names}")
+
+    def cimke_oszlop(d):
+        for k in ("cls", "label", "labels"):
+            if k in d.column_names:
+                return k
+        raise RuntimeError(f"nem találom a címkeoszlopot: {d.column_names}")
+
+    def minta(split, n):
+        d = ds[split]
+        n = min(n, len(d))
+        d = d.shuffle(seed=seed).select(range(n))
+        ik, ck = kep_oszlop(d), cimke_oszlop(d)
+        kepek = [r[ik].convert("L") for r in d]
+        cimkek = np.array([FER_CLASSES_HU[int(r[ck])] for r in d])
+        return kepek, cimkek
+
+    teszt_split = "test" if "test" in ds else "validation"
+    kep_tr, y_tr = minta("train", n_train)
+    kep_te, y_te = minta(teszt_split, n_test)
+    if show_progress:
+        print(f"betöltve: {len(kep_tr)} tanító + {len(kep_te)} teszt kép, "
+              f"méret: {kep_tr[0].size}")
+    return kep_tr, y_tr, kep_te, y_te
+
+
+def plot_image_grid(images, labels, per_class: int = 4, class_names=None,
+                    title: str = "Mintaképek osztályonként"):
+    """Osztályonként néhány mintakép — hogy lássák, mivel dolgozik a modell."""
+    import matplotlib.pyplot as plt
+
+    class_names = class_names or FER_CLASSES_HU
+    labels = np.asarray(labels)
+    sorok = [c for c in class_names if (labels == c).sum() > 0]
+    fig, axes = plt.subplots(len(sorok), per_class,
+                             figsize=(per_class * 1.4, len(sorok) * 1.5))
+    axes = np.atleast_2d(axes)
+    for i, c in enumerate(sorok):
+        idx = np.where(labels == c)[0][:per_class]
+        for j in range(per_class):
+            a = axes[i, j]
+            a.set_xticks([]); a.set_yticks([])
+            for sp in a.spines.values():
+                sp.set_visible(False)
+            if j < len(idx):
+                a.imshow(np.asarray(images[idx[j]]), cmap="gray")
+            if j == 0:
+                a.set_ylabel(c, rotation=0, ha="right", va="center", fontsize=9)
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def hog_features(images, show_progress: bool = True):
+    """Klasszikus képi jellemzők: HOG (Histogram of Oriented Gradients).
+
+    Ez az előadáson említett "megjelenés alapú, hisztogramos" megközelítés —
+    a mélytanulás előtti képi érzelemfelismerés tipikus jellemzőkészlete.
+    Ha a scikit-image nem érhető el, lecsökkentett nyers pixelekre esik vissza.
+    """
+    try:
+        from skimage.feature import hog
+    except ImportError:
+        print("A scikit-image nem érhető el — lecsökkentett nyers pixelekre váltok.")
+        X = np.stack([np.asarray(im.resize((24, 24)), dtype=np.float32).ravel() / 255
+                      for im in images])
+        return X, [f"px{i}" for i in range(X.shape[1])]
+
+    sorok, total = [], len(images)
+    for i, im in enumerate(images):
+        a = np.asarray(im, dtype=np.float32) / 255.0
+        sorok.append(hog(a, orientations=8, pixels_per_cell=(6, 6),
+                         cells_per_block=(2, 2), feature_vector=True))
+        if show_progress and (i + 1) % 1000 == 0:
+            print(f"  {i + 1}/{total} HOG-vektor")
+    X = np.vstack(sorok).astype(np.float32)
+    if show_progress:
+        print(f"  kész: {X.shape[0]} x {X.shape[1]} HOG-jellemzőmátrix")
+    return X, [f"hog{i}" for i in range(X.shape[1])]
+
+
+def _clip_features(model, out, kind: str):
+    """A CLIP jellemzőtenzor kinyerése, transformers-verziótól függetlenül.
+
+    A transformers 4.x-ben a get_image_features / get_text_features kész
+    tenzort ad vissza. Az 5.x-ben egy BaseModelOutputWithPooling objektumba
+    csomagolja, ahol a `pooler_output` MÁR a projektált jellemző — ilyenkor
+    csak ki kell bontani.
+
+    Biztonság kedvéért megnézzük a dimenziót is: a vetítést csak akkor
+    alkalmazzuk, ha a kapott vektor mérete egyértelműen a vetítés BEMENETI
+    mérete (és az eltér a kimenetitől). Így sem a már projektált, sem a nyers
+    kimenet nem romlik el.
+    """
+    import torch
+
+    if torch.is_tensor(out):
+        return out
+
+    pooled = getattr(out, "pooler_output", None)
+    if pooled is None:
+        pooled = getattr(out, "image_embeds", None) or getattr(out, "text_embeds", None)
+    if pooled is None:
+        rejtett = getattr(out, "last_hidden_state", None)
+        if rejtett is not None:
+            pooled = rejtett[:, 0]
+        elif isinstance(out, (tuple, list)) and len(out) > 1:
+            pooled = out[1]
+        else:
+            raise RuntimeError(
+                f"nem tudom kinyerni a CLIP jellemzőket ebből: {type(out).__name__}")
+
+    proj = getattr(model, "visual_projection" if kind == "image"
+                   else "text_projection", None)
+    be = getattr(proj, "in_features", None)
+    ki = getattr(proj, "out_features", None)
+    if proj is not None and be is not None and ki is not None \
+            and pooled.shape[-1] == be and be != ki:
+        # nyers, vetítés előtti kimenet — pótoljuk a vetítést
+        pooled = proj(pooled)
+    return pooled
+
+
+_CLIP_CACHE: dict = {}
+
+
+def _load_clip(model_name: str, device: str):
+    if (model_name, device) not in _CLIP_CACHE:
+        from transformers import CLIPModel, CLIPProcessor
+        model = CLIPModel.from_pretrained(model_name).eval().to(device)
+        proc = CLIPProcessor.from_pretrained(model_name)
+        _CLIP_CACHE[(model_name, device)] = (model, proc)
+    return _CLIP_CACHE[(model_name, device)]
+
+
+def clip_image_embeddings(images, model_name: str = "openai/clip-vit-base-patch32",
+                          batch_size: int | None = None, device: str | None = None,
+                          show_progress: bool = True):
+    """CLIP képi beágyazások — fagyasztott vizuális alapmodell jellemzőkinyerőként.
+
+    Pontosan ugyanaz a recept, mint a hangnál a WavLM: nem hangolunk, csak
+    reprezentációt veszünk ki, és kis fejet tanítunk rá.
+    """
+    import torch
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if batch_size is None:
+        batch_size = max(8, suggested_batch_size(64))
+    model, proc = _load_clip(model_name, device)
+
+    vektorok, total, start = [], len(images), 0
+    with torch.no_grad():
+        while start < total:
+            batch = [im.convert("RGB") for im in images[start:start + batch_size]]
+            try:
+                be = proc(images=batch, return_tensors="pt").to(device)
+                f = _clip_features(model, model.get_image_features(**be), "image")
+                f = f / f.norm(dim=-1, keepdim=True)
+                vektorok.append(f.cpu().numpy())
+                start += batch_size
+                if show_progress and start % (batch_size * 10) == 0:
+                    print(f"  {min(start, total)}/{total} képi embedding")
+            except Exception as exc:
+                if not _is_oom(exc):
+                    raise
+                torch.cuda.empty_cache()
+                if batch_size == 1:
+                    raise RuntimeError(
+                        "Egyetlen kép sem fér a GPU memóriájába. Próbáld "
+                        "device='cpu'-val.") from exc
+                batch_size = max(1, batch_size // 2)
+                print(f"  [kevés a VRAM — batch_size -> {batch_size}]")
+    X = np.vstack(vektorok).astype(np.float32)
+    if show_progress:
+        print(f"  kész: {X.shape[0]} x {X.shape[1]} (CLIP)")
+    return X
+
+
+def clip_zeroshot(images, class_names=None, sablon: str = "a photo of a {} face",
+                  model_name: str = "openai/clip-vit-base-patch32",
+                  device: str | None = None, batch_size: int = 64):
+    """CLIP zero-shot osztályozás: tanítás NÉLKÜL, pusztán szöveges leírásokkal.
+
+    A kategórianeveket angolul adjuk meg (a CLIP angol szövegen tanult),
+    a visszaadott címkék viszont a magyar nevek.
+    """
+    import torch
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    class_names = class_names or FER_CLASSES_EN
+    model, proc = _load_clip(model_name, device)
+
+    with torch.no_grad():
+        szoveg = proc(text=[sablon.format(c) for c in class_names],
+                      return_tensors="pt", padding=True).to(device)
+        T = _clip_features(model, model.get_text_features(**szoveg), "text")
+        T = T / T.norm(dim=-1, keepdim=True)
+
+        becslesek = []
+        ellenorizve = False
+        for start in range(0, len(images), batch_size):
+            batch = [im.convert("RGB") for im in images[start:start + batch_size]]
+            be = proc(images=batch, return_tensors="pt").to(device)
+            I = _clip_features(model, model.get_image_features(**be), "image")
+            I = I / I.norm(dim=-1, keepdim=True)
+            if not ellenorizve:
+                if I.shape[-1] != T.shape[-1]:
+                    raise RuntimeError(
+                        f"a képi ({I.shape[-1]}) és a szöveges ({T.shape[-1]}) "
+                        "jellemzők dimenziója eltér — a zero-shot így "
+                        "értelmetlen lenne. Frissítsd a ser_utils.py-t.")
+                ellenorizve = True
+            becslesek.append((I @ T.T).argmax(dim=-1).cpu().numpy())
+    idx = np.concatenate(becslesek)
+    return np.array(FER_CLASSES_HU, dtype=object)[idx].astype(str)
+
+
+# ==========================================================================
+#  13. SZÖVEGES MODALITÁS — szentiment magyar nyelven
+# ==========================================================================
+HUSST_DATASET = "NYTK/HuSST"
+HUSST_HU = {"negative": "negatív", "neutral": "semleges", "positive": "pozitív"}
+
+
+def load_husst(dataset_name: str = HUSST_DATASET, show_progress: bool = True):
+    """HuSST: a Stanford Sentiment Treebank magyar változata (NYTK).
+
+    A hivatalos teszt split címkézetlen, ezért a validációs halmazt használjuk
+    teszthalmazként. Visszatér: (szoveg_tr, y_tr, szoveg_te, y_te).
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(dataset_name)
+    if show_progress:
+        print("elérhető splitek:", {k: len(v) for k, v in ds.items()})
+
+    def oszlop(d, jeloltek):
+        for k in jeloltek:
+            if k in d.column_names:
+                return k
+        raise RuntimeError(f"nem találom az oszlopot {jeloltek} közül: {d.column_names}")
+
+    def kinyer(split):
+        d = ds[split]
+        sk = oszlop(d, ["sentence", "Sent", "text"])
+        ck = oszlop(d, ["label", "Label", "labels"])
+        szovegek = [r[sk] for r in d]
+        cimkek = [HUSST_HU.get(str(r[ck]).lower(), str(r[ck])) for r in d]
+        return szovegek, np.array(cimkek)
+
+    teszt = "validation" if "validation" in ds else "test"
+    sz_tr, y_tr = kinyer("train")
+    sz_te, y_te = kinyer(teszt)
+    if show_progress:
+        print(f"betöltve: {len(sz_tr)} tanító + {len(sz_te)} teszt mondat "
+              f"(teszthalmaz: a(z) '{teszt}' split, mert a hivatalos test "
+              f"címkézetlen)")
+    return sz_tr, y_tr, sz_te, y_te
+
+
+def tfidf_pipeline(C: float = 4.0, ngram=(1, 2), min_df: int = 2,
+                   max_features: int | None = 50_000):
+    """TF-IDF + logisztikus regresszió — a klasszikus szövegosztályozó alapvonal."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+
+    return make_pipeline(
+        TfidfVectorizer(ngram_range=ngram, min_df=min_df,
+                        max_features=max_features, sublinear_tf=True),
+        LogisticRegression(max_iter=2000, C=C, class_weight="balanced"),
+    )
+
+
+def tfidf_top_features(pipe, k: int = 12):
+    """A legerősebb súlyú szavak osztályonként.
+
+    Ez a klasszikus megközelítés egyik fő előnye: a modell megmagyarázható.
+    """
+    import pandas as pd
+
+    vec = pipe.named_steps["tfidfvectorizer"]
+    clf = pipe.named_steps["logisticregression"]
+    nevek = np.array(vec.get_feature_names_out())
+    sorok = {}
+    for i, osztaly in enumerate(clf.classes_):
+        w = clf.coef_[i] if clf.coef_.shape[0] > 1 else clf.coef_[0]
+        legjobb = np.argsort(w)[::-1][:k]
+        sorok[str(osztaly)] = [f"{nevek[j]} ({w[j]:+.2f})" for j in legjobb]
+    return pd.DataFrame(sorok)
+
+
+_TEXT_CACHE: dict = {}
+
+
+def text_embeddings(texts, model_name: str =
+                    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    batch_size: int = 64, device: str | None = None,
+                    max_length: int = 128, show_progress: bool = True):
+    """Mondatbeágyazások előtanított nyelvi modellel, maszkolt átlagolással.
+
+    Ugyanaz a recept, mint a hangnál: fagyasztott modell + átlagolás.
+    Magyar modellel is működik, pl. model_name="SZTAKI-HLT/hubert-base-cc".
+    """
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if (model_name, device) not in _TEXT_CACHE:
+        tok = AutoTokenizer.from_pretrained(model_name)
+        mod = AutoModel.from_pretrained(model_name).eval().to(device)
+        _TEXT_CACHE[(model_name, device)] = (tok, mod)
+    tok, mod = _TEXT_CACHE[(model_name, device)]
+
+    vektorok, total = [], len(texts)
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            batch = list(texts[start:start + batch_size])
+            be = tok(batch, padding=True, truncation=True,
+                     max_length=max_length, return_tensors="pt").to(device)
+            ki = mod(**be).last_hidden_state
+            m = be["attention_mask"].unsqueeze(-1).float()
+            atlag = (ki * m).sum(1) / m.sum(1).clamp(min=1e-9)
+            vektorok.append(atlag.cpu().numpy())
+            if show_progress and (start // batch_size) % 20 == 19:
+                print(f"  {min(start + batch_size, total)}/{total} mondat")
+    X = np.vstack(vektorok).astype(np.float32)
+    if show_progress:
+        print(f"  kész: {X.shape[0]} x {X.shape[1]} ({model_name.split('/')[-1]})")
+    return X
+
+
+def predict_texts(mondatok, model=None, embed_fn=None, pipe=None):
+    """Saját mondatok osztályozása — a demóhoz.
+
+    Vagy egy TF-IDF pipeline-t adj át (pipe), vagy egy betanított osztályozót
+    és a hozzá tartozó beágyazó függvényt (model + embed_fn).
+    """
+    import pandas as pd
+
+    mondatok = list(mondatok)
+    if pipe is not None:
+        pred = pipe.predict(mondatok)
+    else:
+        pred = model.predict(embed_fn(mondatok))
+    return pd.DataFrame({"mondat": mondatok, "becslés": pred})
